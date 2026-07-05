@@ -55,7 +55,7 @@ HUB = ObjectId(os.environ.get("HUB_ACCOUNT_ID", "667ff8c46518e168b4507186"))
 
 # Slack delivery (same bot token as the other daily scripts; dedicated recon channel).
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
-SLACK_CHANNEL_ID = os.environ.get("RECON_SLACK_CHANNEL_ID", "C0BELJBVCDP")
+SLACK_CHANNEL_ID = os.environ.get("RECON_SLACK_CHANNEL_ID")
 
 IST = ZoneInfo("Asia/Kolkata")
 UTC = ZoneInfo("UTC")
@@ -200,8 +200,13 @@ def flow_physical_leased(db, S, E):
 
 def flow_digi_leased(db, S, E):
     # leased buys (hub as provider OR lessee) minus leased sells (provider=hub)
+    # ⚠ Window on transactionDate (completion/approval instant), NOT createdAt: the hub
+    # digiLeased bucket is $inc'd in confirmSell (gateway/services/wallet.js), i.e. when a sell
+    # is APPROVED — and some sells wait for manual sell-approval. A sell created before the
+    # snapshot boundary but approved after it moves the stored value on the approval day, so the
+    # day's flow must be sliced by transactionDate to match the snapshot delta.
     return agg_one(db, "goldtransactionv2", [
-        {"$match": {**_win(S, E), "source": "digi", "status": "completed",
+        {"$match": {**_win(S, E, "transactionDate"), "source": "digi", "status": "completed",
                     "$or": [{"provider": HUB}, {"lessee": HUB}]}},
         {"$group": {"_id": None, "flow": {"$sum": {"$switch": {"branches": [
             {"case": {"$and": [{"$eq": ["$type", "buy"]}, {"$eq": ["$isLeased", True]}]}, "then": "$quantity"},
@@ -213,8 +218,10 @@ def flow_digi_leased(db, S, E):
 
 def flow_digi_purchased(db, S, E):
     # sell(provider=hub) minus buy(provider=hub)  — the re-lease (E1b) / sell-back (E2) split
+    # ⚠ transactionDate, not createdAt — same completion/approval-time basis as flow_digi_leased
+    # (digiPurchased is $inc'd at confirmSell/approval).
     return agg_one(db, "goldtransactionv2", [
-        {"$match": {**_win(S, E), "source": "digi", "status": "completed", "provider": HUB}},
+        {"$match": {**_win(S, E, "transactionDate"), "source": "digi", "status": "completed", "provider": HUB}},
         {"$group": {"_id": None, "flow": {"$sum": {"$switch": {"branches": [
             {"case": {"$eq": ["$type", "sell"]}, "then": "$quantity"},
             {"case": {"$eq": ["$type", "buy"]}, "then": {"$multiply": [-1, "$quantity"]}},
@@ -281,8 +288,17 @@ def flow_leased_to_lp(db, S, E):
 
 
 def flow_total(db, S, E):
-    # composite roll-up: physical (upload_gold/sell_old_gold in, sell/release/gift out)
-    # + digital leased-in funded fresh (buy isLeased, provider != hub) − digi release/redeem out of hub
+    # Composite roll-up. `mv.total` (= stored hub.wallet.total, $inc'd by the gold engine) moves
+    # ONLY on events where gold enters or leaves myVault *entirely*. Per the engine $inc map:
+    #   IN  : upload_gold, sell_old_gold (physical) ; fresh leased-in digi buys (provider != hub)
+    #   OUT : customer sell_gold/release_gold/gift_sent (physical) ; digi release/redeem (provider=hub)
+    #         + MARKET SELL shipped from the vault centre (goldrequests, seller=hub)   ← see below
+    #         + refiner-melt shrinkage + ecom-coin redemption  ← KNOWN GAP (0 on non-melt/
+    #           non-redemption days; add & validate when a melt/redemption day first surfaces them)
+    # ⚠ Do NOT add flow_centre here: most centre movements (refiner→centre, verifier→centre,
+    #   centre→LP drawdown) are INTERNAL reshuffles that leave total unchanged — only outright
+    #   exits from myVault reduce it. Adding the whole centre net would break the roll-up on
+    #   internal-transfer days.
     physical = agg_one(db, "goldtransactionv2", [
         {"$match": {**_win(S, E), "source": "upload", "status": "completed"}},
         {"$group": {"_id": None, "flow": {"$sum": {"$switch": {"branches": [
@@ -301,14 +317,24 @@ def flow_total(db, S, E):
              "then": {"$multiply": [-1, "$quantity"]}},
         ], "default": 0}}}}},
     ])
-    return physical + digital
+    # Gold sold out of the vault centre to the bullion market (myVault → trader). Recorded in
+    # `goldrequests` (seller=hub), NOT in goldtransactionv2 — so neither term above ever saw it,
+    # which is exactly what made mv.total breach by −99.5 g on 03-Jul-2026 (invoice SB/26-27/010).
+    # Reuse the already-validated flow_market_sold (the same term that reconciles sell.balance).
+    market_out = flow_market_sold(db, S, E)
+    return physical + digital - market_out
 
 
-# L-aggregation confirmations (the day's windowed re-aggregation == the delta, by construction)
+# L-aggregation confirmations (the day's windowed re-aggregation == the delta, by construction).
+# ⚠ These mirror the DATELESS cumulative mvDigi.buy/sell/redeem aggregation in the dashboard
+# (computeVaultSummary), which sums over all status="completed" digi rows. A row enters that sum
+# the instant it becomes completed/approved — so window on transactionDate (approval/completion
+# instant), NOT createdAt. Manual sell-approval routinely lags order→approval across the midnight
+# snapshot boundary (this was the 03-Jul-2026 +0.0772 g breach on mvDigi.buy).
 
 def flow_mvdigi_buy(db, S, E):
     return agg_one(db, "goldtransactionv2", [
-        {"$match": {**_win(S, E), "source": "digi", "status": "completed",
+        {"$match": {**_win(S, E, "transactionDate"), "source": "digi", "status": "completed",
                     "$or": [{"provider": HUB}, {"lessee": HUB}, {"transferredTo": HUB},
                             {"type": "redeem", "customer": HUB}]}},
         {"$group": {"_id": None, "flow": {"$sum": {"$cond": [{"$or": [
@@ -319,15 +345,17 @@ def flow_mvdigi_buy(db, S, E):
 
 
 def flow_mvdigi_sell(db, S, E):
+    # transactionDate (completion basis) — see flow_mvdigi_buy note.
     return agg_one(db, "goldtransactionv2", [
-        {"$match": {**_win(S, E), "source": "digi", "status": "completed", "type": "buy", "provider": HUB}},
+        {"$match": {**_win(S, E, "transactionDate"), "source": "digi", "status": "completed", "type": "buy", "provider": HUB}},
         {"$group": {"_id": None, "flow": {"$sum": "$quantity"}}},
     ])
 
 
 def flow_mvdigi_redeem(db, S, E):
+    # transactionDate (completion basis) — see flow_mvdigi_buy note.
     return agg_one(db, "goldtransactionv2", [
-        {"$match": {**_win(S, E), "source": "digi", "status": "completed", "type": "redeem", "customer": HUB}},
+        {"$match": {**_win(S, E, "transactionDate"), "source": "digi", "status": "completed", "type": "redeem", "customer": HUB}},
         {"$group": {"_id": None, "flow": {"$sum": "$quantity"}}},
     ])
 
