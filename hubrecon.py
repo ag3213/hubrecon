@@ -151,6 +151,79 @@ def _win(gte, lt, field="createdAt"):
     return {field: {"$gte": gte, "$lt": lt}}
 
 
+# ---------- hub digital-wallet replay (mirrors gateway/src/services/wallet.js) ----------
+# The two digi buckets (hub.wallet.digiLeased / digiPurchased) and the digital slice of
+# hub.wallet.total are $inc'd by the gold engine at CONFIRMATION/approval (confirmBuy/Sell/
+# Release), across several event shapes that a per-field aggregation kept missing one at a
+# time. Rather than re-encode that write-set as brittle nested $switch pipelines, we replay it
+# directly in Python over the day's completed digi/upload txns — windowed by `transactionDate`
+# (the approval instant; some sells wait for manual sell-approval). One pass yields all three
+# numbers; memoized so the three callers share a single DB scan.
+#   Write-set (file:line in finalbackend/gateway/src/services/wallet.js):
+#     buy  leased            → digiLeased +q (93); if provider==hub digiPurchased -q (92);
+#                              if provider!=hub total +q (91, fresh leased-in)
+#     sell/redeem digi-leased→ digiLeased -q, digiPurchased +q (169-170)   [total unchanged]
+#     release   digi-leased  → digiLeased -q, digiPurchased +q (239-240)   [total unchanged]
+#     gift of UPLOAD leased  → digiPurchased -q, digiLeased +q (302-303)   [engine-transcribed;
+#                              unfired 30Jun–5Jul, validate on first occurrence]
+#   Exception — immediately-sold accrued interest (actionName=lease_growth, moduleName=
+#   lease_interest): its buy leg DISCARDS merchantWalletUpdates (sell.js:1001 keeps only the
+#   customer side), so the hub wallet is moved only by its paired sell_lease_growth. Confirmed
+#   1:1 across full history (12 buys Σ68.8002g ↔ 12 sell_lease_growth Σ68.8002g). So its buy
+#   must NOT credit hub digiLeased or total.
+_DIGI_REPLAY_CACHE = {}
+
+
+def _digi_replay(db, S, E):
+    key = (S, E)
+    if key in _DIGI_REPLAY_CACHE:
+        return _DIGI_REPLAY_CACHE[key]
+    dL = dP = dTot = 0.0
+    rows = db.goldtransactionv2.find(
+        {**_win(S, E, "transactionDate"), "status": "completed",
+         "$or": [{"provider": HUB}, {"lessee": HUB}, {"transferredTo": HUB}, {"customer": HUB}]},
+        {"type": 1, "actionName": 1, "moduleName": 1, "source": 1, "isLeased": 1,
+         "quantity": 1, "provider": 1, "transferredTo": 1},
+        max_time_ms=MAX_TIME_MS,
+    )
+    for r in rows:
+        t = r.get("type")
+        src = r.get("source")
+        q = float(r.get("quantity") or 0)
+        prov_is_hub = r.get("provider") == HUB
+        to_is_hub = r.get("transferredTo") == HUB
+        sold_interest = (r.get("actionName") == "lease_growth"
+                         and r.get("moduleName") == "lease_interest")
+        if t == "buy":
+            if r.get("isLeased") and not sold_interest:
+                dL += q
+                if not prov_is_hub:
+                    dTot += q
+            if r.get("isLeased") and prov_is_hub:
+                dP -= q
+        elif t in ("sell", "redeem", "release"):
+            # engine branches on the txn's own `type`; a plain sell/redeem/release (type != transfer)
+            # always takes the digi-leased branch regardless of transferredTo.
+            if src != "upload" and prov_is_hub:
+                dL -= q
+                dP += q
+        elif t == "transfer":
+            if to_is_hub:
+                # A sell whose gold is routed to the hub, booked with type=transfer
+                # (actionName=sell_gold) → engine's getSell/getRelease TRANSFER branch
+                # (wallet.js:144-147 / 217-220): company acquires it — digiPurchased +q, total +q,
+                # digiLeased untouched. This was the 07-Jul-2026 non-leased sell-to-hub of 6.4803 g.
+                # (mvDigi.buy already counts transfer→hub; only digiPurchased/total needed it.)
+                dP += q
+                dTot += q
+            elif r.get("isLeased") and src == "upload" and prov_is_hub:
+                dP -= q
+                dL += q
+    out = {"digiLeased": dL, "digiPurchased": dP, "digitalTotal": dTot}
+    _DIGI_REPLAY_CACHE[key] = out
+    return out
+
+
 # ---------- FLOW QUERIES (each returns the day's signed movement, in grams) ----------
 # All validated exact against the 30-Jun snapshot deltas on the live DB.
 
@@ -199,34 +272,16 @@ def flow_physical_leased(db, S, E):
 
 
 def flow_digi_leased(db, S, E):
-    # leased buys (hub as provider OR lessee) minus leased sells (provider=hub)
-    # ⚠ Window on transactionDate (completion/approval instant), NOT createdAt: the hub
-    # digiLeased bucket is $inc'd in confirmSell (gateway/services/wallet.js), i.e. when a sell
-    # is APPROVED — and some sells wait for manual sell-approval. A sell created before the
-    # snapshot boundary but approved after it moves the stored value on the approval day, so the
-    # day's flow must be sliced by transactionDate to match the snapshot delta.
-    return agg_one(db, "goldtransactionv2", [
-        {"$match": {**_win(S, E, "transactionDate"), "source": "digi", "status": "completed",
-                    "$or": [{"provider": HUB}, {"lessee": HUB}]}},
-        {"$group": {"_id": None, "flow": {"$sum": {"$switch": {"branches": [
-            {"case": {"$and": [{"$eq": ["$type", "buy"]}, {"$eq": ["$isLeased", True]}]}, "then": "$quantity"},
-            {"case": {"$and": [{"$eq": ["$type", "sell"]}, {"$eq": ["$provider", HUB]}]},
-             "then": {"$multiply": [-1, "$quantity"]}},
-        ], "default": 0}}}}},
-    ])
+    # Full wallet.js write-set for hub.wallet.digiLeased (buy leased +, sell/release/redeem
+    # digi-leased −, gift-of-upload +, immediately-sold accrued interest excluded). See
+    # _digi_replay for the derivation and the code references.
+    return _digi_replay(db, S, E)["digiLeased"]
 
 
 def flow_digi_purchased(db, S, E):
-    # sell(provider=hub) minus buy(provider=hub)  — the re-lease (E1b) / sell-back (E2) split
-    # ⚠ transactionDate, not createdAt — same completion/approval-time basis as flow_digi_leased
-    # (digiPurchased is $inc'd at confirmSell/approval).
-    return agg_one(db, "goldtransactionv2", [
-        {"$match": {**_win(S, E, "transactionDate"), "source": "digi", "status": "completed", "provider": HUB}},
-        {"$group": {"_id": None, "flow": {"$sum": {"$switch": {"branches": [
-            {"case": {"$eq": ["$type", "sell"]}, "then": "$quantity"},
-            {"case": {"$eq": ["$type", "buy"]}, "then": {"$multiply": [-1, "$quantity"]}},
-        ], "default": 0}}}}},
-    ])
+    # Full wallet.js write-set for hub.wallet.digiPurchased (sell/release/redeem digi-leased +,
+    # re-lease buy(provider=hub) −, gift-of-upload −). See _digi_replay.
+    return _digi_replay(db, S, E)["digiPurchased"]
 
 
 def flow_centre(db, S, E):
@@ -257,8 +312,13 @@ def flow_refining_commissions(db, S, E):
 
 def flow_bullion_ordered(db, S, E):
     # net: orders placed (+) minus cancelled/completed (−). v1 nets ordered vs cancelled.
+    # ⚠ Window on `createdAt` (when the order was placed / bullionMarketOrdered $inc'd), NOT
+    # `date` — `date` is a user-set order date that is routinely BACK-dated (the 09-Jul-2026
+    # order carried date=06-Jul but createdAt=09-Jul, so a `date` window missed it → the 09-Jul
+    # breach). GROSS `quantity` (matches the snapshot field = gross ordered weight, e.g.
+    # 5×1000=5000); the FINE content (×purity) is counted only inside mv.total.
     return agg_one(db, "goldrecoveries", [
-        {"$match": {**_win(S, E, "date"), "account": HUB}},
+        {"$match": {**_win(S, E, "createdAt"), "account": HUB}},
         {"$group": {"_id": None, "flow": {"$sum": {"$cond": [
             {"$eq": ["$status", "ordered"]}, {"$ifNull": ["$quantity", 0]},
             {"$cond": [{"$in": ["$status", ["cancelled", "completed"]]},
@@ -287,42 +347,60 @@ def flow_leased_to_lp(db, S, E):
     ])
 
 
+def flow_ecom_redemption(db, S, E):
+    # Ecom coin redemption: a customer takes physical delivery of a coin, shipped OUT of the
+    # vault centre (mvcentretransactions type=out, orderType=customer_release). Gold leaves
+    # myVault entirely, so mv.total −= this. Distinct from the market bullion sale (goldrequests,
+    # orderType=sell_gold). First fired 07-Jul-2026 (2× customer_release = 2.9997 g). The centre
+    # bucket already sees it via flow_centre; this is its effect on the total roll-up.
+    return agg_one(db, "mvcentretransactions", [
+        {"$match": {**_win(S, E), "type": "out", "orderType": "customer_release"}},
+        {"$group": {"_id": None, "flow": {"$sum": {"$toDouble": {"$ifNull": ["$fineQuantity", 0]}}}}},
+    ])
+
+
+# One-time data migration: ~10-Jul-2026 a developer added a `purity`/`fineQuantity` field to
+# goldrecoveries (backfilled to past orders) and mv.total switched its bullion contribution from
+# GROSS (Σ quantity) to FINE (Σ quantity×purity). That is a one-step restatement of mv.total by
+# −Σ(quantity − fineQuantity) over the then-existing HUB bullion orders — NOT a transaction, so no
+# flow can explain it. Confirmed: the mv.total−Σcomponents offset shifted exactly −25.0000 g
+# between the 10-Jul-00:00 and 11-Jul-00:00 snapshots, then held constant. User-confirmed to treat
+# it as a one-time explained exception. We add the computed restatement to flow_total for (and
+# only for) the window that brackets it, so 10-Jul reconciles and every later day stays clean.
+PURITY_MIGRATION_INSTANT = datetime(2026, 7, 10, 12, 0, tzinfo=IST).astimezone(UTC)
+
+
 def flow_total(db, S, E):
-    # Composite roll-up. `mv.total` (= stored hub.wallet.total, $inc'd by the gold engine) moves
-    # ONLY on events where gold enters or leaves myVault *entirely*. Per the engine $inc map:
-    #   IN  : upload_gold, sell_old_gold (physical) ; fresh leased-in digi buys (provider != hub)
-    #   OUT : customer sell_gold/release_gold/gift_sent (physical) ; digi release/redeem (provider=hub)
-    #         + MARKET SELL shipped from the vault centre (goldrequests, seller=hub)   ← see below
-    #         + refiner-melt shrinkage + ecom-coin redemption  ← KNOWN GAP (0 on non-melt/
-    #           non-redemption days; add & validate when a melt/redemption day first surfaces them)
-    # ⚠ Do NOT add flow_centre here: most centre movements (refiner→centre, verifier→centre,
-    #   centre→LP drawdown) are INTERNAL reshuffles that leave total unchanged — only outright
-    #   exits from myVault reduce it. Adding the whole centre net would break the roll-up on
-    #   internal-transfer days.
-    physical = agg_one(db, "goldtransactionv2", [
-        {"$match": {**_win(S, E), "source": "upload", "status": "completed"}},
-        {"$group": {"_id": None, "flow": {"$sum": {"$switch": {"branches": [
-            {"case": {"$in": ["$actionName", ["upload_gold", "sell_old_gold"]]}, "then": "$quantity"},
-            {"case": {"$in": ["$actionName", ["sell_gold", "release_gold", "gift_sent"]]},
-             "then": {"$multiply": [-1, "$quantity"]}},
-        ], "default": 0}}}}},
-    ])
-    digital = agg_one(db, "goldtransactionv2", [
-        {"$match": {**_win(S, E), "source": "digi", "status": "completed",
-                    "$or": [{"lessee": HUB}, {"provider": HUB}, {"customer": HUB}, {"transferredTo": HUB}]}},
-        {"$group": {"_id": None, "flow": {"$sum": {"$switch": {"branches": [
-            {"case": {"$and": [{"$eq": ["$type", "buy"]}, {"$eq": ["$isLeased", True]},
-                               {"$ne": ["$provider", HUB]}]}, "then": "$quantity"},
-            {"case": {"$and": [{"$in": ["$type", ["release", "redeem"]]}, {"$eq": ["$provider", HUB]}]},
-             "then": {"$multiply": [-1, "$quantity"]}},
-        ], "default": 0}}}}},
-    ])
-    # Gold sold out of the vault centre to the bullion market (myVault → trader). Recorded in
-    # `goldrequests` (seller=hub), NOT in goldtransactionv2 — so neither term above ever saw it,
-    # which is exactly what made mv.total breach by −99.5 g on 03-Jul-2026 (invoice SB/26-27/010).
-    # Reuse the already-validated flow_market_sold (the same term that reconciles sell.balance).
-    market_out = flow_market_sold(db, S, E)
-    return physical + digital - market_out
+    # Roll-up. VALIDATED IDENTITY (30-Jun→10-Jul): mv.total's daily change == the sum of its
+    # component buckets' daily changes. So flow_total = Σ(component flows). Every gold-moving
+    # event is already captured by its own component bucket — this replaces the earlier
+    # term-by-term proxy patching (market-sale/melt/ecom-redemption), each of which was only a
+    # stand-in for what flow_centre / flow_verifier already see, and each of which broke on the
+    # first day its assumption didn't hold.
+    #   components = verifier + centre + inHand + leasedToLp + bullionOrdered(gross)
+    #               + digiLeased + digiPurchased
+    # ⚠ Deliberately NOT summed: upload.uploaded (would double-count verifier's upload_gold
+    #   inflow) and mv.refiner (no validated flow; ~0 in practice). A material refiner-transit or
+    #   overnight-at-refiner day would surface here as a total breach — by design, not silently.
+    rep = _digi_replay(db, S, E)
+    total = (flow_verifier(db, S, E)
+             + flow_centre(db, S, E)
+             + flow_inhand(db, S, E)
+             + flow_leased_to_lp(db, S, E)
+             + flow_bullion_ordered(db, S, E)
+             + rep["digiLeased"]
+             + rep["digiPurchased"])
+    if S <= PURITY_MIGRATION_INSTANT < E:
+        # one-time gross→fine bullion restatement (see PURITY_MIGRATION_INSTANT note). Computed
+        # from data (not a magic constant); scoped to orders that existed before the migration.
+        gap = agg_one(db, "goldrecoveries", [
+            {"$match": {"account": HUB, "status": "ordered",
+                        "createdAt": {"$lt": PURITY_MIGRATION_INSTANT}}},
+            {"$group": {"_id": None, "flow": {"$sum": {"$subtract": [
+                {"$ifNull": ["$quantity", 0]}, {"$ifNull": ["$fineQuantity", 0]}]}}}},
+        ])
+        total -= gap
+    return total
 
 
 # L-aggregation confirmations (the day's windowed re-aggregation == the delta, by construction).
@@ -389,7 +467,7 @@ BUCKET_CHECKS = [
     ("leasedToLp",            "Leased to LP",                   "mv.leasedOut",           flow_leased_to_lp,              "⚠ split-brain: b2b_lease_transactions (see scope §B.4)"),
 ]
 
-ROLLUP_CHECK = ("total", "myVault Total (roll-up)", "mv.total", flow_total, "physical in/out + digital leased-in")
+ROLLUP_CHECK = ("total", "myVault Total (roll-up)", "mv.total", flow_total, "Σ component flows: verifier+centre+inHand+leasedToLp+bullion+digiLeased+digiPurchased")
 
 LCONFIRM_CHECKS = [
     ("mvDigiBuy",    "MV Buy (digi agg)",     "mvDigi.buy",         flow_mvdigi_buy,    "Σ users' sell/release into vault"),
@@ -544,6 +622,13 @@ def write_report(path, D, opening_doc, closing_doc, S, E, flow_rows, ident_rows,
                 d=g(r["delta"]), mv=("yes" if r["moved"] else "—"),
             ))
         f.write("\n")
+
+        if S <= PURITY_MIGRATION_INSTANT < E:
+            f.write("> ⚠ **One-time restatement applied:** a purity/`fineQuantity` backfill on "
+                    "bullion orders restated `mv.total` from gross→fine (a −25 g step across "
+                    "pre-existing HUB orders). This is a data migration, not a transaction; "
+                    "`flow_total` includes it once for this window so the day reconciles. "
+                    "Reconciliation is clean without it from the next day onward.\n\n")
 
         f.write("## Notes\n\n")
         for r in flow_rows:
